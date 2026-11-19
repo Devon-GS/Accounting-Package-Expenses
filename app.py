@@ -7,25 +7,29 @@ import re
 import sqlite3
 import zipfile
 from contextlib import closing
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from io import StringIO
 from pathlib import Path
 from typing import Iterable
 from uuid import uuid4
+from urllib.parse import urlsplit
 
 from flask import (
 	Flask,
 	flash,
 	g,
+	jsonify,
 	redirect,
 	render_template,
 	send_file,
 	request,
+	session,
 	url_for,
 )
 from ofxparse import OfxParser
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
+from werkzeug.security import check_password_hash
 from werkzeug.utils import secure_filename
 
 try:
@@ -88,14 +92,32 @@ SPEEDPOINT_HIGHLIGHT = PatternFill(fill_type="solid", fgColor="FF86B9")
 BANK_HIGHLIGHT = PatternFill(fill_type="solid", fgColor="FFFF00")
 
 app = Flask(__name__)
-app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-accounting-secret")
+SESSION_SECRET = os.environ.get("SESSION_SECRET", "").strip()
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "").strip()
+ADMIN_PASSWORD_HASH = os.environ.get("ADMIN_PASSWORD_HASH", "").strip()
+AUTH_CONFIGURED = bool(SESSION_SECRET and ADMIN_USERNAME and ADMIN_PASSWORD_HASH)
+RENDER_ENVIRONMENT = os.environ.get("RENDER", "").strip().lower() not in {"", "0", "false", "no"}
+COOKIE_SECURE_OVERRIDE = os.environ.get("SESSION_COOKIE_SECURE", "").strip().lower()
+SESSION_COOKIE_SECURE = (
+	COOKIE_SECURE_OVERRIDE in {"1", "true", "yes", "on"}
+	if COOKIE_SECURE_OVERRIDE
+	else RENDER_ENVIRONMENT
+)
+
+# There is intentionally no fallback secret. If these values are absent, login
+# remains unavailable and no authenticated session can be created.
+app.config["SECRET_KEY"] = SESSION_SECRET or None
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=30)
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SECURE"] = SESSION_COOKIE_SECURE
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
 
 app_name = os.environ.get('APP_NAME', 'Company Name')
 
 @app.context_processor
 def inject_global_vars():
-    return dict(app_name=app_name)
+	return dict(app_name=app_name, auth_configured=AUTH_CONFIGURED)
 
 
 class QueryResult:
@@ -1585,7 +1607,23 @@ def bootstrap_storage() -> None:
 
 
 @app.before_request
+def require_authentication() -> None:
+	if request.endpoint in {"login", "logout", "health", "static"}:
+		return
+
+	if AUTH_CONFIGURED and session.get("authenticated") is True:
+		return
+
+	if request.path == "/api" or request.path.startswith("/api/"):
+		return jsonify(error="Unauthorized"), 401
+
+	return redirect(url_for("login", next=_safe_next_url(request.url) or request.path))
+
+
+@app.before_request
 def prepare_app() -> None:
+	if request.endpoint in {"login", "logout", "health", "static"}:
+		return
 	initialize_storage()
 	if not getattr(app, "_seeded_accounts", False):
 		sync_account_names()
@@ -1597,6 +1635,64 @@ def close_connection(_: Exception | None = None) -> None:
 	db = g.pop("db", None)
 	if db is not None:
 		db.close()
+
+
+def _safe_next_url(candidate: str | None) -> str | None:
+	"""Allow only relative local paths for post-login redirects."""
+	if not candidate or "\\" in candidate:
+		return None
+
+	parsed = urlsplit(candidate)
+	if parsed.scheme or parsed.netloc or not candidate.startswith("/") or candidate.startswith("//"):
+		return None
+	return candidate
+
+
+@app.route("/health")
+def health():
+	return "OK", 200
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+	next_url = _safe_next_url(request.values.get("next")) or url_for("index")
+	error_message = None
+
+	if request.method == "POST":
+		username = request.form.get("username", "").strip()
+		password = request.form.get("password", "")
+		try:
+			password_matches = check_password_hash(ADMIN_PASSWORD_HASH, password) if AUTH_CONFIGURED else False
+		except (ValueError, TypeError):
+			password_matches = False
+		valid_credentials = AUTH_CONFIGURED and username == ADMIN_USERNAME and password_matches
+
+		if valid_credentials:
+			session.clear()
+			session.permanent = True
+			session["authenticated"] = True
+			session["username"] = ADMIN_USERNAME
+			return redirect(next_url)
+
+		if not AUTH_CONFIGURED:
+			error_message = "Login is unavailable until the authentication environment variables are configured."
+		else:
+			flash("Invalid username or password.", "danger")
+
+	return render_template(
+		"login.html",
+		title="Log in",
+		show_nav=False,
+		next_url=next_url,
+		error_message=error_message,
+	)
+
+
+@app.route("/logout", methods=["POST"])
+def logout():
+	if AUTH_CONFIGURED:
+		session.clear()
+	return redirect(url_for("login"))
 
 
 @app.route("/")

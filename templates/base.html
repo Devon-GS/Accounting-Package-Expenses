@@ -23,6 +23,9 @@
             <a class="nav-link" href="{{ url_for('eft_payments') }}">EFT Payments</a>
             <a class="nav-link" href="{{ url_for('accounts') }}">Accounts</a>
             <a class="nav-link" href="{{ url_for('settings') }}">Settings</a>
+            <form method="post" action="{{ url_for('logout') }}" class="d-flex align-items-center ms-lg-2">
+              <button type="submit" class="btn btn-sm btn-outline-light">Log out</button>
+            </form>
           </div>
         </div>
       </div>
@@ -30,15 +33,17 @@
   {% endif %}
 
   <main class="container py-4 flex-grow-1">
-    {% with messages = get_flashed_messages(with_categories=true) %}
-      {% if messages %}
-        <div class="mb-4">
-          {% for category, message in messages %}
-            <div class="alert alert-{{ category }} shadow-sm mb-2" role="alert">{{ message }}</div>
-          {% endfor %}
-        </div>
-      {% endif %}
-    {% endwith %}
+    {% if auth_configured %}
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+          <div class="mb-4">
+            {% for category, message in messages %}
+              <div class="alert alert-{{ category }} shadow-sm mb-2" role="alert">{{ message }}</div>
+            {% endfor %}
+          </div>
+        {% endif %}
+      {% endwith %}
+    {% endif %}
 
     {% block content %}{% endblock %}
   </main>

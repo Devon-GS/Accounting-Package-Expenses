@@ -16,6 +16,20 @@ body {
   flex-direction: column;
 }
 
+.login-shell {
+  min-height: calc(100vh - 8rem);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.login-card {
+  width: min(100%, 28rem);
+  border: 1px solid rgba(8, 19, 31, 0.08);
+  border-radius: 1.5rem;
+  box-shadow: 0 1.25rem 3rem rgba(8, 19, 31, 0.14);
+}
+
 .app-nav {
   background: linear-gradient(90deg, var(--app-bg), var(--app-bg-2));
   box-shadow: 0 10px 30px rgba(7, 19, 31, 0.25);
