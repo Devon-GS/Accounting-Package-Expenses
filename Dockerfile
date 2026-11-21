@@ -11,7 +11,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-RUN mkdir -p /app/instance && chmod +x /app/docker/entrypoint.sh
+RUN mkdir -p /app/instance \
+    && sed -i 's/\r$//' /app/docker/entrypoint.sh \
+    && chmod +x /app/docker/entrypoint.sh
 
 EXPOSE 5000
 
