@@ -6,9 +6,13 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL}
       SECRET_KEY: ${APP_SECRET_KEY}
+      SESSION_SECRET: ${SESSION_SECRET}
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE}
       PORT: 5000
       APP_NAME: ${APP_NAME}
       WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}
+      ADMIN_USERNAME: ${ADMIN_USERNAME}
+      ADMIN_PASSWORD_HASH: ${ADMIN_PASSWORD_HASH}
     volumes:
       - app_instance_data:/app/instance
     networks:
