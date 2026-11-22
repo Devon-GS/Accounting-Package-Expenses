@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
 import sqlite3
+import threading
+import time
 import zipfile
 from contextlib import closing
 from datetime import date, datetime, timedelta
@@ -96,18 +100,31 @@ SESSION_SECRET = os.environ.get("SESSION_SECRET", "").strip()
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "").strip()
 ADMIN_PASSWORD_HASH = os.environ.get("ADMIN_PASSWORD_HASH", "").strip()
 AUTH_CONFIGURED = bool(SESSION_SECRET and ADMIN_USERNAME and ADMIN_PASSWORD_HASH)
-RENDER_ENVIRONMENT = os.environ.get("RENDER", "").strip().lower() not in {"", "0", "false", "no"}
 COOKIE_SECURE_OVERRIDE = os.environ.get("SESSION_COOKIE_SECURE", "").strip().lower()
 SESSION_COOKIE_SECURE = (
 	COOKIE_SECURE_OVERRIDE in {"1", "true", "yes", "on"}
 	if COOKIE_SECURE_OVERRIDE
-	else RENDER_ENVIRONMENT
+	else os.environ.get("FLASK_ENV", "").strip().lower() == "production"
 )
+SESSION_VERSION = os.environ.get("SESSION_VERSION", "1").strip() or "1"
+SESSION_LIFETIME_HOURS = max(1, int(os.environ.get("SESSION_LIFETIME_HOURS", "8")))
+
+MAX_UPLOAD_FILES = 25
+MAX_UPLOAD_FILE_BYTES = 10 * 1024 * 1024
+MAX_WORKBOOK_UNCOMPRESSED_BYTES = 100 * 1024 * 1024
+MAX_ZIP_MEMBERS = 10_000
+
+LOGIN_FAILURE_LIMIT = 5
+LOGIN_FAILURE_WINDOW_SECONDS = 15 * 60
+LOGIN_BLOCK_SECONDS = 15 * 60
+_login_attempts: dict[str, dict[str, float | int]] = {}
+_login_attempts_lock = threading.Lock()
 
 # There is intentionally no fallback secret. If these values are absent, login
 # remains unavailable and no authenticated session can be created.
 app.config["SECRET_KEY"] = SESSION_SECRET or None
-app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=30)
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(hours=SESSION_LIFETIME_HOURS)
+app.config["SESSION_REFRESH_EACH_REQUEST"] = False
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SECURE"] = SESSION_COOKIE_SECURE
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
@@ -117,7 +134,44 @@ app_name = os.environ.get('APP_NAME', 'Company Name')
 
 @app.context_processor
 def inject_global_vars():
-	return dict(app_name=app_name, auth_configured=AUTH_CONFIGURED)
+	return dict(
+		app_name=app_name,
+		auth_configured=AUTH_CONFIGURED,
+		csrf_token=csrf_token,
+	)
+
+
+def csrf_token() -> str:
+	"""Return a per-session token for protecting all state-changing requests."""
+	token = session.get("csrf_token")
+	if not token:
+		token = secrets.token_urlsafe(32)
+		session["csrf_token"] = token
+	return token
+
+
+@app.after_request
+def add_security_headers(response):
+	response.headers.setdefault(
+		"Content-Security-Policy",
+		"default-src 'self'; "
+		"script-src 'self' https://cdn.jsdelivr.net 'unsafe-inline'; "
+		"style-src 'self' https://cdn.jsdelivr.net 'unsafe-inline'; "
+		"img-src 'self' data:; "
+		"font-src 'self' https://cdn.jsdelivr.net; "
+		"connect-src 'self'; frame-ancestors 'none'; "
+		"base-uri 'self'; form-action 'self'",
+	)
+	response.headers.setdefault("X-Content-Type-Options", "nosniff")
+	response.headers.setdefault("X-Frame-Options", "DENY")
+	response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+	response.headers.setdefault(
+		"Permissions-Policy",
+		"camera=(), microphone=(), geolocation=(), payment=()",
+	)
+	if SESSION_COOKIE_SECURE:
+		response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+	return response
 
 
 class QueryResult:
@@ -853,6 +907,7 @@ def process_speedpoint_reconciliation(speedpoint_storage, bank_storages: list) -
 	speedpoint_safe_name = secure_filename(speedpoint_original_name) or "speedpoint.xlsx"
 	speedpoint_input_path = run_dir / f"input_{speedpoint_safe_name}"
 	speedpoint_storage.save(speedpoint_input_path)
+	validate_uploaded_file(speedpoint_input_path, zip_expected=True)
 
 	speedpoint_workbook = load_workbook(speedpoint_input_path)
 	speedpoint_sheet = pick_speedpoint_sheet(speedpoint_workbook)
@@ -866,6 +921,7 @@ def process_speedpoint_reconciliation(speedpoint_storage, bank_storages: list) -
 		bank_safe_name = secure_filename(bank_original_name) or f"bank_statement_{index}.xlsx"
 		bank_input_path = run_dir / f"input_{index:02d}_{bank_safe_name}"
 		bank_storage.save(bank_input_path)
+		validate_uploaded_file(bank_input_path, zip_expected=True)
 
 		bank_workbook = load_workbook(bank_input_path)
 		bank_sheet = pick_bank_statement_sheet(bank_workbook)
@@ -1002,6 +1058,7 @@ def stage_workbook(
     file_storage.save(temp_path)
 
     try:
+        validate_uploaded_file(temp_path, zip_expected=True)
         file_hash = sha256_file(temp_path)
         existing = query_one("SELECT id FROM import_files WHERE file_hash = ?", (file_hash,))
         if existing:
@@ -1168,6 +1225,7 @@ def stage_ofx_file(
 	file_storage.save(temp_path)
 
 	try:
+		validate_uploaded_file(temp_path, zip_expected=False)
 		file_hash = sha256_file(temp_path)
 		existing = query_one("SELECT id FROM import_files WHERE file_hash = ?", (file_hash,))
 		if existing:
@@ -1606,13 +1664,96 @@ def bootstrap_storage() -> None:
 		app._seeded_accounts = True
 
 
+def _login_key() -> str:
+	remote_addr = request.remote_addr or "unknown"
+	username = request.form.get("username", "").strip().casefold()
+	return f"{remote_addr}:{username}"
+
+
+def _login_is_blocked(key: str) -> bool:
+	now = time.monotonic()
+	with _login_attempts_lock:
+		attempt = _login_attempts.get(key)
+		if not attempt:
+			return False
+		if float(attempt["block_until"]) > now:
+			return True
+		if now - float(attempt["window_started"]) >= LOGIN_FAILURE_WINDOW_SECONDS:
+			_login_attempts.pop(key, None)
+		return False
+
+
+def _record_login_failure(key: str) -> None:
+	now = time.monotonic()
+	with _login_attempts_lock:
+		attempt = _login_attempts.get(key)
+		if not attempt or now - float(attempt["window_started"]) >= LOGIN_FAILURE_WINDOW_SECONDS:
+			attempt = {"window_started": now, "failures": 0, "block_until": 0.0}
+		_login_attempts[key] = attempt
+		attempt["failures"] = int(attempt["failures"]) + 1
+		if int(attempt["failures"]) >= LOGIN_FAILURE_LIMIT:
+			attempt["block_until"] = now + LOGIN_BLOCK_SECONDS
+
+
+def _clear_login_failures(key: str) -> None:
+	with _login_attempts_lock:
+		_login_attempts.pop(key, None)
+
+
+def validate_uploaded_file(path: Path, *, zip_expected: bool) -> None:
+	"""Apply size and archive-bomb checks before handing uploads to parsers."""
+	file_size = path.stat().st_size
+	if file_size > MAX_UPLOAD_FILE_BYTES:
+		raise ValueError(f"Uploaded file exceeds the {MAX_UPLOAD_FILE_BYTES // (1024 * 1024)} MB limit.")
+
+	if not zip_expected:
+		return
+	if not zipfile.is_zipfile(path):
+		raise ValueError("The uploaded workbook is not a valid Excel archive.")
+
+	with zipfile.ZipFile(path) as archive:
+		members = archive.infolist()
+		if len(members) > MAX_ZIP_MEMBERS:
+			raise ValueError("The uploaded workbook contains too many archive members.")
+		uncompressed_size = sum(member.file_size for member in members)
+		if uncompressed_size > MAX_WORKBOOK_UNCOMPRESSED_BYTES:
+			raise ValueError("The uploaded workbook expands beyond the permitted size.")
+		for member in members:
+			if member.file_size and member.compress_size:
+				ratio = member.file_size / member.compress_size
+				if ratio > 1_000:
+					raise ValueError("The uploaded workbook has an unsafe compression ratio.")
+
+
+def validate_upload_collection(files: list, *, maximum: int) -> None:
+	if len(files) > maximum:
+		raise ValueError(f"You can upload at most {maximum} files at once.")
+	for file_storage in files:
+		declared_size = getattr(file_storage, "content_length", None)
+		if declared_size and declared_size > MAX_UPLOAD_FILE_BYTES:
+			raise ValueError(f"Each uploaded file must be smaller than {MAX_UPLOAD_FILE_BYTES // (1024 * 1024)} MB.")
+
+
+PUBLIC_ENDPOINTS = {"login", "logout", "health", "static"}
+
+
 @app.before_request
 def require_authentication() -> None:
-	if request.endpoint in {"login", "logout", "health", "static"}:
+	# Authentication is deliberately the first request gate. Every endpoint is
+	# private by default; only the explicitly listed endpoints are public.
+	if request.endpoint in PUBLIC_ENDPOINTS:
 		return
 
-	if AUTH_CONFIGURED and session.get("authenticated") is True:
+	if (
+		AUTH_CONFIGURED
+		and session.get("authenticated") is True
+		and session.get("session_version") == SESSION_VERSION
+	):
 		return
+
+	# Do not leave an invalid or stale authenticated session in the client
+	# cookie. The login page will establish a fresh CSRF token if needed.
+	session.clear()
 
 	if request.path == "/api" or request.path.startswith("/api/"):
 		return jsonify(error="Unauthorized"), 401
@@ -1621,8 +1762,18 @@ def require_authentication() -> None:
 
 
 @app.before_request
+def protect_state_changing_requests():
+	if request.endpoint in {"health", "static"} or request.method not in {"POST", "PUT", "PATCH", "DELETE"}:
+		return
+
+	submitted_token = request.form.get("csrf_token") or request.headers.get("X-CSRFToken")
+	if not submitted_token or not hmac.compare_digest(submitted_token, csrf_token()):
+		return jsonify(error="CSRF validation failed"), 400
+
+
+@app.before_request
 def prepare_app() -> None:
-	if request.endpoint in {"login", "logout", "health", "static"}:
+	if request.endpoint in PUBLIC_ENDPOINTS:
 		return
 	initialize_storage()
 	if not getattr(app, "_seeded_accounts", False):
@@ -1659,6 +1810,17 @@ def login():
 	error_message = None
 
 	if request.method == "POST":
+		login_key = _login_key()
+		if _login_is_blocked(login_key):
+			flash("Too many failed login attempts. Please try again later.", "danger")
+			return render_template(
+				"login.html",
+				title="Log in",
+				show_nav=False,
+				next_url=next_url,
+				error_message=error_message,
+			), 429
+
 		username = request.form.get("username", "").strip()
 		password = request.form.get("password", "")
 		try:
@@ -1668,15 +1830,19 @@ def login():
 		valid_credentials = AUTH_CONFIGURED and username == ADMIN_USERNAME and password_matches
 
 		if valid_credentials:
+			_clear_login_failures(login_key)
 			session.clear()
 			session.permanent = True
 			session["authenticated"] = True
 			session["username"] = ADMIN_USERNAME
+			session["session_version"] = SESSION_VERSION
+			session["csrf_token"] = secrets.token_urlsafe(32)
 			return redirect(next_url)
 
 		if not AUTH_CONFIGURED:
 			error_message = "Login is unavailable until the authentication environment variables are configured."
 		else:
+			_record_login_failure(login_key)
 			flash("Invalid username or password.", "danger")
 
 	return render_template(
@@ -1817,13 +1983,22 @@ def speedpoint_uploads():
 		if not bank_files:
 			flash("Please choose at least one Bank Statements .xlsx file.", "warning")
 			return redirect(url_for("speedpoint_uploads"))
+		try:
+			validate_upload_collection([speedpoint_file, *bank_files], maximum=MAX_UPLOAD_FILES)
+		except ValueError as exc:
+			flash(str(exc), "danger")
+			return redirect(url_for("speedpoint_uploads"))
 
 		for bank_file in bank_files:
 			if Path(bank_file.filename).suffix.lower() not in SPEEDPOINT_UPLOAD_EXTENSIONS:
 				flash("All Bank Statements files must be .xlsx workbooks.", "warning")
 				return redirect(url_for("speedpoint_uploads"))
 
-		manifest = process_speedpoint_reconciliation(speedpoint_file, bank_files)
+		try:
+			manifest = process_speedpoint_reconciliation(speedpoint_file, bank_files)
+		except ValueError as exc:
+			flash(str(exc), "danger")
+			return redirect(url_for("speedpoint_uploads"))
 		return redirect(url_for("speedpoint_uploads", run_id=manifest["run_id"]))
 
 	run_id = request.args.get("run_id", type=str)
@@ -1882,6 +2057,11 @@ def upload_cash_payments():
     if not files:
         flash("Please choose one or more Excel files.", "warning")
         return redirect(url_for("cash_payments"))
+    try:
+        validate_upload_collection(files, maximum=MAX_UPLOAD_FILES)
+    except ValueError as exc:
+        flash(str(exc), "danger")
+        return redirect(url_for("cash_payments"))
 
     batch_id = execute(
         "INSERT INTO import_batches (source_folder, source_type, status) VALUES (?, ?, ?)",
@@ -1904,12 +2084,16 @@ def upload_cash_payments():
             flash(str(exc), "danger")
             continue
 
-        file_id, staged_count, duplicate_flag = stage_workbook(
-            batch_id=batch_id,
-            file_storage=file_storage,
-            original_filename=Path(file_storage.filename).name,
-            file_date=file_date,
-        )
+        try:
+            file_id, staged_count, duplicate_flag = stage_workbook(
+                batch_id=batch_id,
+                file_storage=file_storage,
+                original_filename=Path(file_storage.filename).name,
+                file_date=file_date,
+            )
+        except ValueError as exc:
+            flash(f"Skipped {file_storage.filename}: {exc}", "warning")
+            continue
         if duplicate_flag:
             duplicates += 1
             continue
@@ -1951,6 +2135,11 @@ def upload_eft_payments():
 	if not files:
 		flash("Please choose one or more OFX files.", "warning")
 		return redirect(url_for("eft_payments"))
+	try:
+		validate_upload_collection(files, maximum=MAX_UPLOAD_FILES)
+	except ValueError as exc:
+		flash(str(exc), "danger")
+		return redirect(url_for("eft_payments"))
 
 	batch_id = execute(
 		"INSERT INTO import_batches (source_folder, source_type, status) VALUES (?, ?, ?)",
@@ -1967,11 +2156,15 @@ def upload_eft_payments():
 		if Path(file_storage.filename).suffix.lower() != ".ofx":
 			flash(f"Skipped {file_storage.filename}: only .ofx files are supported.", "warning")
 			continue
-		file_id, staged_count, duplicate_flag = stage_ofx_file(
-			batch_id=batch_id,
-			file_storage=file_storage,
-			original_filename=Path(file_storage.filename).name,
-		)
+		try:
+			file_id, staged_count, duplicate_flag = stage_ofx_file(
+				batch_id=batch_id,
+				file_storage=file_storage,
+				original_filename=Path(file_storage.filename).name,
+			)
+		except ValueError as exc:
+			flash(f"Skipped {file_storage.filename}: {exc}", "warning")
+			continue
 		if duplicate_flag:
 			duplicates += 1
 			continue

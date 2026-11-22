@@ -14,6 +14,7 @@
       <div class="card-body p-4">
         <h2 class="h5 fw-bold mb-3">Upload Folder</h2>
         <form method="post" action="{{ url_for('upload_eft_payments') }}" enctype="multipart/form-data">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <label class="form-label">OFX bank statements</label>
           <input class="form-control mb-2" type="file" name="files" multiple webkitdirectory directory accept=".ofx,.OFX">
           <input class="form-control mb-3" type="file" name="files" multiple accept=".ofx,.OFX">
@@ -111,7 +112,9 @@
 
 {% if summary and summary.unresolved %}
   {% for row in summary.unresolved %}
-    <form id="resolve-{{ row.staged_id }}" method="post" action="{{ url_for('resolve_eft_payment_item', staged_id=row.staged_id) }}"></form>
+    <form id="resolve-{{ row.staged_id }}" method="post" action="{{ url_for('resolve_eft_payment_item', staged_id=row.staged_id) }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    </form>
   {% endfor %}
 {% endif %}
 

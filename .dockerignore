@@ -8,6 +8,7 @@ env/
 .venv/
 .git/
 .gitignore
+.env
 instance/
 *.xlsm
 *.ofx

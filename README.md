@@ -168,6 +168,21 @@ cp .env.example .env
 
 > 💡 **Tip:** Never commit your `.env` file or sensitive credentials to version control.
 
+### Production HTTPS
+
+For production, terminate TLS at a trusted reverse proxy or load balancer in front of Gunicorn. Forward only HTTPS traffic to the application and set:
+
+```dotenv
+FLASK_ENV=production
+SESSION_COOKIE_SECURE=true
+SESSION_SECRET=<long-random-secret>
+SESSION_VERSION=1
+```
+
+`SESSION_COOKIE_SECURE=true` ensures authenticated cookies are sent only over HTTPS. Increment `SESSION_VERSION` to invalidate all existing sessions after a credential or security incident. Keep the Docker PostgreSQL port bound to `127.0.0.1`; production deployments should use Neon or a private database network rather than exposing PostgreSQL publicly.
+
+Local development intentionally defaults to `FLASK_ENV=development` and insecure cookies so `http://localhost:5000` continues to work.
+
 <!-- --- -->
 
 <!-- ## 🤝 Contributing

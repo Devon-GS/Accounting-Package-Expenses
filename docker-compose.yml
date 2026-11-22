@@ -7,7 +7,7 @@ services:
       POSTGRES_USER: accounting
       POSTGRES_PASSWORD: ${DB_PASSWORD}
     ports:
-      - "${DB_PORT_BINDING}:5432"   #Used for speedpoint recon access
+      - "127.0.0.1:${DB_PORT_BINDING:-5432}:5432"   # Local speedpoint recon access only
     volumes:
       - postgres_primary_data:/var/lib/postgresql/data
     healthcheck:
@@ -23,9 +23,11 @@ services:
     container_name: ${DOCKER_NAME}-accounting-system
     environment:
       DATABASE_URL: postgresql://accounting:${DB_PASSWORD}@db-primary:5432/accounting
-      SECRET_KEY: ${APP_SECRET_KEY}
       SESSION_SECRET: ${SESSION_SECRET}
       SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE}
+      FLASK_ENV: ${FLASK_ENV:-development}
+      SESSION_VERSION: ${SESSION_VERSION:-1}
+      SESSION_LIFETIME_HOURS: ${SESSION_LIFETIME_HOURS:-8}
       PORT: 5000
       APP_NAME: ${APP_NAME}
       WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}

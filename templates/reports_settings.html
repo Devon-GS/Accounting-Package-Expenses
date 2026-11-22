@@ -90,6 +90,7 @@
     <div class="modal-dialog modal-lg modal-dialog-scrollable">
       <div class="modal-content">
         <form method="post">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <input type="hidden" name="action" value="{% if description_key in report_linked_description_keys %}add_links{% else %}create_fixed{% endif %}">
           <div class="modal-header">
             {% if description_key in report_linked_description_keys %}
@@ -169,6 +170,7 @@
               <div class="border rounded p-3 mb-3">
                 <div class="d-flex flex-wrap align-items-end gap-3 justify-content-between">
                   <form method="post" class="row g-3 align-items-end flex-grow-1">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                     <input type="hidden" name="action" value="update_fixed">
                     <input type="hidden" name="description_key" value="{{ item.description_key }}">
                     <input type="hidden" name="entry_id" value="{{ item.id }}">
@@ -185,6 +187,7 @@
                     </div>
                   </form>
                   <form method="post">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                     <input type="hidden" name="action" value="delete_fixed">
                     <input type="hidden" name="description_key" value="{{ item.description_key }}">
                     <input type="hidden" name="entry_id" value="{{ item.id }}">

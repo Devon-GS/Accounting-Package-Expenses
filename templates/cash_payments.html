@@ -15,6 +15,7 @@
       <div class="card-body p-4">
         <h2 class="h5 fw-bold mb-3">Upload Folder</h2>
         <form method="post" action="{{ url_for('upload_cash_payments') }}" enctype="multipart/form-data">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <label class="form-label">Excel folder or files</label>
           <input class="form-control mb-3" type="file" name="files" multiple webkitdirectory directory accept=".xlsx,.xlsm">
           <div class="form-text mb-3">Select the folder that contains the cash payment Excel files.</div>
@@ -111,7 +112,9 @@
 
 {% if summary and summary.unresolved %}
   {% for row in summary.unresolved %}
-    <form id="resolve-{{ row.staged_id }}" method="post" action="{{ url_for('resolve_cash_payment_item', staged_id=row.staged_id) }}"></form>
+    <form id="resolve-{{ row.staged_id }}" method="post" action="{{ url_for('resolve_cash_payment_item', staged_id=row.staged_id) }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    </form>
   {% endfor %}
 {% endif %}
 
