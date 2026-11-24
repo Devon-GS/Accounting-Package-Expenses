@@ -17,3 +17,9 @@ instance/
 *.sqlite3
 1 - Assets
 instance
+.pytest_cache
+**/.pytest_cache
+__pycache__
+**/__pycache__
+*.pyc
+tests

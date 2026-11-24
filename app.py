@@ -3,15 +3,19 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import threading
 import time
 import zipfile
 from contextlib import closing
-from datetime import date, datetime, timedelta
+from contextlib import contextmanager
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from io import StringIO
 from pathlib import Path
 from typing import Iterable
@@ -33,6 +37,7 @@ from flask import (
 from ofxparse import OfxParser
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
+from openpyxl.utils.exceptions import InvalidFileException
 from werkzeug.security import check_password_hash
 from werkzeug.utils import secure_filename
 
@@ -101,10 +106,11 @@ ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "").strip()
 ADMIN_PASSWORD_HASH = os.environ.get("ADMIN_PASSWORD_HASH", "").strip()
 AUTH_CONFIGURED = bool(SESSION_SECRET and ADMIN_USERNAME and ADMIN_PASSWORD_HASH)
 COOKIE_SECURE_OVERRIDE = os.environ.get("SESSION_COOKIE_SECURE", "").strip().lower()
+FLASK_ENV = os.environ.get("FLASK_ENV", "").strip().lower()
 SESSION_COOKIE_SECURE = (
-	COOKIE_SECURE_OVERRIDE in {"1", "true", "yes", "on"}
-	if COOKIE_SECURE_OVERRIDE
-	else os.environ.get("FLASK_ENV", "").strip().lower() == "production"
+	True
+	if FLASK_ENV == "production"
+	else COOKIE_SECURE_OVERRIDE in {"1", "true", "yes", "on"}
 )
 SESSION_VERSION = os.environ.get("SESSION_VERSION", "1").strip() or "1"
 SESSION_LIFETIME_HOURS = max(1, int(os.environ.get("SESSION_LIFETIME_HOURS", "8")))
@@ -113,12 +119,15 @@ MAX_UPLOAD_FILES = 25
 MAX_UPLOAD_FILE_BYTES = 10 * 1024 * 1024
 MAX_WORKBOOK_UNCOMPRESSED_BYTES = 100 * 1024 * 1024
 MAX_ZIP_MEMBERS = 10_000
+MONEY_QUANTUM = Decimal("0.01")
+ARTIFACT_RETENTION_SECONDS = 30 * 24 * 60 * 60
+SPEEDPOINT_RUN_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 
 LOGIN_FAILURE_LIMIT = 5
 LOGIN_FAILURE_WINDOW_SECONDS = 15 * 60
 LOGIN_BLOCK_SECONDS = 15 * 60
-_login_attempts: dict[str, dict[str, float | int]] = {}
-_login_attempts_lock = threading.Lock()
+_cleanup_lock = threading.Lock()
+_last_cleanup_at = 0.0
 
 # There is intentionally no fallback secret. If these values are absent, login
 # remains unavailable and no authenticated session can be created.
@@ -160,7 +169,7 @@ def add_security_headers(response):
 		"img-src 'self' data:; "
 		"font-src 'self' https://cdn.jsdelivr.net; "
 		"connect-src 'self'; frame-ancestors 'none'; "
-		"base-uri 'self'; form-action 'self'",
+		"base-uri 'self'; form-action 'self'; object-src 'none'; frame-src 'none'",
 	)
 	response.headers.setdefault("X-Content-Type-Options", "nosniff")
 	response.headers.setdefault("X-Frame-Options", "DENY")
@@ -172,6 +181,40 @@ def add_security_headers(response):
 	if SESSION_COOKIE_SECURE:
 		response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 	return response
+
+
+class UploadProcessingError(ValueError):
+	"""Safe, user-facing error for rejected or unreadable uploaded files."""
+
+
+def quantize_money(value: Decimal) -> Decimal:
+	return value.quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP)
+
+
+def money_for_database(value: Decimal) -> float:
+	"""Keep compatibility with existing SQLite REAL columns and old data."""
+	return float(quantize_money(value))
+
+
+def money_from_database(value: object) -> Decimal:
+	return quantize_money(Decimal(str(value or 0)))
+
+
+def payment_business_key(payment_date: str, supplier_name: str, amount: Decimal) -> tuple[str, str, Decimal]:
+	return payment_date, supplier_name, quantize_money(amount)
+
+
+def existing_payment_occurrences(payment_date: str, supplier_name: str, amount: Decimal) -> int:
+	params = (payment_date, supplier_name, money_for_database(amount))
+	payments = query_one(
+		"SELECT COUNT(*) AS count FROM payments WHERE payment_date = ? AND supplier_name = ? AND amount_paid = ?",
+		params,
+	)["count"]
+	staged = query_one(
+		"SELECT COUNT(*) AS count FROM staged_payments WHERE payment_date = ? AND supplier_name = ? AND amount_paid = ?",
+		params,
+	)["count"]
+	return int(payments or 0) + int(staged or 0)
 
 
 class QueryResult:
@@ -273,25 +316,23 @@ def account_match_score(account_name: object, description_tokens: set[str]) -> i
 	return 0
 
 
-def parse_money(value: object) -> float | None:
+def parse_money(value: object) -> Decimal | None:
 	if value in (None, ""):
 		return None
-	if isinstance(value, str):
-		cleaned = value.replace(" ", "").replace(",", "")
-		if not cleaned:
-			return None
-		try:
-			number = float(cleaned)
-		except ValueError:
-			return None
-	else:
-		try:
-			number = float(value)
-		except (TypeError, ValueError):
-			return None
-	if abs(number) < 1e-9:
+	cleaned = value.replace(" ", "").replace(",", "") if isinstance(value, str) else value
+	try:
+		number = Decimal(str(cleaned))
+	except (InvalidOperation, TypeError, ValueError):
 		return None
-	return round(number, 2)
+	if not number.is_finite() or not math.isfinite(float(number)):
+		return None
+	try:
+		number = quantize_money(number)
+	except InvalidOperation:
+		return None
+	if number == 0:
+		return None
+	return number
 
 
 def parse_filename_date(filename: str) -> str:
@@ -372,6 +413,25 @@ def query_all(sql: str, params: tuple = ()) -> list[sqlite3.Row]:
 	return get_connection().execute(_translate_sql(sql), params).fetchall()
 
 
+@contextmanager
+def db_transaction():
+	conn = get_connection()
+	depth = getattr(g, "transaction_depth", 0)
+	if depth == 0:
+		conn.execute("BEGIN")
+	g.transaction_depth = depth + 1
+	try:
+		yield conn
+		g.transaction_depth -= 1
+		if depth == 0:
+			conn.commit()
+	except Exception:
+		g.transaction_depth = depth
+		if depth == 0:
+			conn.rollback()
+		raise
+
+
 def execute(sql: str, params: tuple = ()) -> sqlite3.Cursor:
 	conn = get_connection()
 	translated_sql = _translate_sql(sql)
@@ -384,7 +444,8 @@ def execute(sql: str, params: tuple = ()) -> sqlite3.Cursor:
 		lastrowid = row["id"] if row else None
 	elif not USE_POSTGRES:
 		lastrowid = None if getattr(cur, "rowcount", -1) == 0 else cur.lastrowid
-	conn.commit()
+	if getattr(g, "transaction_depth", 0) == 0:
+		conn.commit()
 	return QueryResult(cur, lastrowid)
 
 
@@ -401,6 +462,12 @@ def initialize_storage() -> None:
 				conn.execute("ALTER TABLE import_batches ADD COLUMN source_type TEXT NOT NULL DEFAULT 'cash'")
 			conn.execute(
 				"UPDATE import_batches SET source_type = 'cash' WHERE source_type IS NULL OR TRIM(source_type) = ''"
+			)
+			conn.execute(
+				"ALTER TABLE payments ALTER COLUMN amount_paid TYPE NUMERIC(12,2) USING ROUND(amount_paid::numeric, 2)"
+			)
+			conn.execute(
+				"ALTER TABLE report_fixed_amounts ALTER COLUMN amount TYPE NUMERIC(12,2) USING ROUND(amount::numeric, 2)"
 			)
 			conn.commit()
 		return
@@ -528,6 +595,14 @@ def sqlite_schema_statements() -> list[str]:
 			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 		);
 		""",
+		"""
+		CREATE TABLE IF NOT EXISTS login_attempts (
+			attempt_key TEXT PRIMARY KEY,
+			window_started REAL NOT NULL,
+			failures INTEGER NOT NULL,
+			block_until REAL NOT NULL
+		);
+		""",
 	]
 
 
@@ -626,6 +701,14 @@ def postgres_schema_statements() -> list[str]:
 			entry_date TEXT NOT NULL,
 			amount REAL NOT NULL,
 			created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP::text)
+		)
+		""",
+		"""
+		CREATE TABLE IF NOT EXISTS login_attempts (
+			attempt_key TEXT PRIMARY KEY,
+			window_started DOUBLE PRECISION NOT NULL,
+			failures INTEGER NOT NULL,
+			block_until DOUBLE PRECISION NOT NULL
 		)
 		""",
 	]
@@ -808,21 +891,18 @@ def pick_speedpoint_sheet(workbook):
 	return workbook.worksheets[0]
 
 
-def parse_amount(value: object) -> float | None:
-	number = parse_money(value)
-	if number is None:
-		return None
-	return round(number, 2)
+def parse_amount(value: object) -> Decimal | None:
+	return parse_money(value)
 
 
 def find_speedpoint_match(
 	worksheet,
 	terminal_column: int,
 	batch_number: int,
-	expected_amount: float,
-) -> tuple[int | None, float | None, bool]:
+	expected_amount: Decimal,
+) -> tuple[int | None, Decimal | None, bool]:
 	candidate_row: int | None = None
-	candidate_amount: float | None = None
+	candidate_amount: Decimal | None = None
 	for row_number in range(1, worksheet.max_row + 1):
 		batch_value = worksheet.cell(row=row_number, column=terminal_column).value
 		if batch_value in (None, ""):
@@ -848,11 +928,11 @@ def find_speedpoint_total_match(
 	expected_amount: float,
 	start_column: int = 7,
 	end_column: int = 15,
-) -> tuple[int | None, float | None, bool]:
+	) -> tuple[int | None, Decimal | None, bool]:
 	candidate_row: int | None = None
-	candidate_total: float | None = None
+	candidate_total: Decimal | None = None
 	for row_number in range(1, worksheet.max_row + 1):
-		row_total = 0.0
+		row_total = Decimal("0.00")
 		has_amount = False
 		for column_number in range(start_column, end_column + 1):
 			amount = parse_amount(worksheet.cell(row=row_number, column=column_number).value)
@@ -862,7 +942,7 @@ def find_speedpoint_total_match(
 			has_amount = True
 		if not has_amount:
 			continue
-		row_total = round(row_total, 2)
+		row_total = quantize_money(row_total)
 		if row_total == expected_amount:
 			return row_number, row_total, True
 		if candidate_row is None:
@@ -899,8 +979,46 @@ def build_result_zip(run_dir: Path, manifest: dict[str, object]) -> Path:
 	return zip_path
 
 
+def cleanup_expired_artifacts(force: bool = False) -> None:
+	global _last_cleanup_at
+	now = time.time()
+	if not force and now - _last_cleanup_at < 3600:
+		return
+	with _cleanup_lock:
+		if not force and now - _last_cleanup_at < 3600:
+			return
+		cutoff = now - ARTIFACT_RETENTION_SECONDS
+		if UPLOAD_DIR.exists():
+			for item in UPLOAD_DIR.iterdir():
+				if item.name == SPEEDPOINT_RUNS_DIR.name:
+					continue
+				try:
+					if item.is_file() and item.stat().st_mtime < cutoff:
+						item.unlink()
+					elif item.is_dir() and item.stat().st_mtime < cutoff:
+						shutil.rmtree(item)
+				except OSError:
+					app.logger.warning("Could not clean expired upload artifact %s", item.name)
+		if SPEEDPOINT_RUNS_DIR.exists():
+			for run_dir in SPEEDPOINT_RUNS_DIR.iterdir():
+				try:
+					if run_dir.is_dir() and run_dir.stat().st_mtime < cutoff:
+						shutil.rmtree(run_dir)
+				except OSError:
+					app.logger.warning("Could not clean expired reconciliation run %s", run_dir.name)
+		_last_cleanup_at = now
+
+
 def process_speedpoint_reconciliation(speedpoint_storage, bank_storages: list) -> dict[str, object]:
 	run_id = uuid4().hex
+	try:
+		return _process_speedpoint_reconciliation(speedpoint_storage, bank_storages, run_id)
+	except (UploadProcessingError, InvalidFileException, zipfile.BadZipFile, OSError, ValueError, KeyError, IndexError, TypeError):
+		shutil.rmtree(SPEEDPOINT_RUNS_DIR / run_id, ignore_errors=True)
+		raise UploadProcessingError("One or more uploaded workbooks could not be processed safely.")
+
+
+def _process_speedpoint_reconciliation(speedpoint_storage, bank_storages: list, run_id: str) -> dict[str, object]:
 	run_dir = build_speedpoint_result_dir(run_id)
 
 	speedpoint_original_name = Path(speedpoint_storage.filename).name
@@ -941,9 +1059,9 @@ def process_speedpoint_reconciliation(speedpoint_storage, bank_storages: list) -
 			if not transaction_info or credit_amount is None:
 				continue
 
-			expected_amount = float(credit_amount)
+			expected_amount = credit_amount
 			match_row: int | None = None
-			match_amount: float | None = None
+			match_amount: Decimal | None = None
 			exact_match = False
 			reason = "No match found"
 
@@ -985,20 +1103,21 @@ def process_speedpoint_reconciliation(speedpoint_storage, bank_storages: list) -
 					"sheet_name": bank_sheet.title,
 					"row_number": row_number,
 					"transaction": compact_text(transaction_cell.value),
-					"credit": expected_amount,
+					"credit": float(expected_amount),
 					"terminal": transaction_info.get("speedpoint_terminal") or transaction_info.get("bank_terminal") or "",
 					"bank_terminal": transaction_info["bank_terminal"],
 					"batch_number": transaction_info["batch_number"],
 					"transaction_type": transaction_info["transaction_type"],
 					"reason": reason,
 					"matched_row": match_row,
-					"matched_amount": match_amount,
+					"matched_amount": float(match_amount) if match_amount is not None else None,
 				}
 			)
 
 		bank_output_name = f"edited_{index:02d}_{bank_safe_name}"
 		bank_output_path = run_dir / bank_output_name
 		bank_workbook.save(bank_output_path)
+		bank_workbook.close()
 		bank_download_name = format_download_name(bank_original_name)
 		edited_files.append(
 			{
@@ -1011,6 +1130,7 @@ def process_speedpoint_reconciliation(speedpoint_storage, bank_storages: list) -
 	speedpoint_output_name = f"edited_{speedpoint_safe_name}"
 	speedpoint_output_path = run_dir / speedpoint_output_name
 	speedpoint_workbook.save(speedpoint_output_path)
+	speedpoint_workbook.close()
 	edited_files.insert(
 		0,
 		{
@@ -1040,10 +1160,19 @@ def process_speedpoint_reconciliation(speedpoint_storage, bank_storages: list) -
 
 
 def load_speedpoint_manifest(run_id: str) -> dict[str, object] | None:
+	if not SPEEDPOINT_RUN_ID_PATTERN.fullmatch(run_id or ""):
+		return None
 	manifest_path = SPEEDPOINT_RUNS_DIR / run_id / "manifest.json"
 	if not manifest_path.exists():
 		return None
-	return json.loads(manifest_path.read_text(encoding="utf-8"))
+	try:
+		manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+	except (OSError, json.JSONDecodeError):
+		return None
+	zip_filename = manifest.get("zip_filename")
+	if not isinstance(zip_filename, str) or Path(zip_filename).name != zip_filename:
+		return None
+	return manifest
 
 
 def stage_workbook(
@@ -1055,6 +1184,7 @@ def stage_workbook(
     source_path = Path(file_storage.filename)
     safe_name = secure_filename(source_path.name) or "upload.xlsx"
     temp_path = UPLOAD_DIR / f"batch{batch_id}_{safe_name}"
+    stored_path: Path | None = None
     file_storage.save(temp_path)
 
     try:
@@ -1069,87 +1199,78 @@ def stage_workbook(
         stored_path = UPLOAD_DIR / stored_name
         temp_path.replace(stored_path)
 
-        cursor = execute(
+        with db_transaction():
+            cursor = execute(
             """
             INSERT INTO import_files (batch_id, original_filename, stored_filename, file_hash, file_date)
             VALUES (?, ?, ?, ?, ?)
             """,
             (batch_id, original_filename, stored_name, file_hash, file_date),
-        )
-        file_id = cursor.lastrowid
-        workbook = load_workbook(stored_path, data_only=True, read_only=True)
-        worksheet = pick_payment_sheet(workbook)
-        staged_rows = 0
+            )
+            file_id = cursor.lastrowid
+            try:
+                workbook = load_workbook(stored_path, data_only=True, read_only=True)
+            except (InvalidFileException, zipfile.BadZipFile, OSError, KeyError, IndexError, TypeError) as exc:
+                raise UploadProcessingError("The uploaded workbook could not be read safely.") from exc
+            try:
+                worksheet = pick_payment_sheet(workbook)
+                staged_rows = 0
+                file_occurrences: dict[tuple[str, str, Decimal], int] = {}
+                existing_counts: dict[tuple[str, str, Decimal], int] = {}
 
-        for row_number in PAYMENT_RANGE:
-            supplier_name = worksheet.cell(row=row_number, column=1).value
-            if supplier_name in (None, ""):
-                continue
-            supplier_name = str(supplier_name).strip()
-            if not supplier_name:
-                continue
-            supplier_key = normalize_text(supplier_name)
-            for column_number in PAYMENT_COLUMNS:
-                amount = parse_money(worksheet.cell(row=row_number, column=column_number).value)
-                if amount is None:
-                    continue
-                duplicate_row = query_one(
-                    """
-                    SELECT 1
-                    FROM payments
-                    WHERE payment_date = ?
-                      AND supplier_name = ?
-                      AND amount_paid = ?
-                    UNION
-                    SELECT 1
-                    FROM staged_payments
-                    WHERE payment_date = ?
-                      AND supplier_name = ?
-                      AND amount_paid = ?
-                    LIMIT 1
-                    """,
-                    (
-                        file_date,
-                        supplier_name,
-                        amount,
-                        file_date,
-                        supplier_name,
-                        amount,
-                    ),
-                )
-                if duplicate_row:
-                    continue
-                account = resolve_account_for_supplier(supplier_name)
-                account_id = account["account_id"] if account and "account_id" in account.keys() else None
-                if account is not None and "id" in account.keys():
-                    account_id = account["id"]
-                execute(
-                    """
-                    INSERT INTO staged_payments (
-                        batch_id, file_id, payment_date, supplier_name, supplier_key,
-                        amount_paid, source_sheet, source_row, source_column, account_id
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT (file_id, source_sheet, source_row, source_column) DO NOTHING
-                    """,
-                    (
-                        batch_id,
-                        file_id,
-                        file_date,
-                        supplier_name,
-                        supplier_key,
-                        amount,
-                        worksheet.title,
-                        row_number,
-                        column_number,
-                        account_id,
-                    ),
-                )
-                staged_rows += 1
+                for row_number in PAYMENT_RANGE:
+                    supplier_name = worksheet.cell(row=row_number, column=1).value
+                    if supplier_name in (None, ""):
+                        continue
+                    supplier_name = str(supplier_name).strip()
+                    if not supplier_name:
+                        continue
+                    supplier_key = normalize_text(supplier_name)
+                    for column_number in PAYMENT_COLUMNS:
+                        amount = parse_money(worksheet.cell(row=row_number, column=column_number).value)
+                        if amount is None:
+                            continue
+                        business_key = payment_business_key(file_date, supplier_name, amount)
+                        file_occurrences[business_key] = file_occurrences.get(business_key, 0) + 1
+                        if business_key not in existing_counts:
+                            existing_counts[business_key] = existing_payment_occurrences(file_date, supplier_name, amount)
+                        if file_occurrences[business_key] <= existing_counts[business_key]:
+                            continue
+                        account = resolve_account_for_supplier(supplier_name)
+                        account_id = account["account_id"] if account and "account_id" in account.keys() else None
+                        if account is not None and "id" in account.keys():
+                            account_id = account["id"]
+                        execute(
+                            """
+                            INSERT INTO staged_payments (
+                                batch_id, file_id, payment_date, supplier_name, supplier_key,
+                                amount_paid, source_sheet, source_row, source_column, account_id
+                            )
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ON CONFLICT (file_id, source_sheet, source_row, source_column) DO NOTHING
+                            """,
+                            (
+                                batch_id,
+                                file_id,
+                                file_date,
+                                supplier_name,
+                                supplier_key,
+                                money_for_database(amount),
+                                worksheet.title,
+                                row_number,
+                                column_number,
+                                account_id,
+                            ),
+                        )
+                        staged_rows += 1
+                finalize_resolved_rows(batch_id)
+            finally:
+                workbook.close()
 
-        finalize_resolved_rows(batch_id)
         return file_id, staged_rows, False
     except Exception:
+        if stored_path is not None:
+            stored_path.unlink(missing_ok=True)
         temp_path.unlink(missing_ok=True)
         raise
 
@@ -1171,10 +1292,14 @@ def date_to_iso(value: object) -> str | None:
 
 
 def parse_ofx_transactions(file_path: Path) -> list[dict[str, object]]:
-	raw_text = file_path.read_text(encoding="latin-1")
-	raw_text = re.sub(r"CHARSET:NONE", "CHARSET:1252", raw_text, flags=re.IGNORECASE)
-	with StringIO(raw_text) as handle:
-		ofx = OfxParser.parse(handle)
+	try:
+		raw_text = file_path.read_text(encoding="latin-1")
+		raw_text = re.sub(r"CHARSET:NONE", "CHARSET:1252", raw_text, flags=re.IGNORECASE)
+		with StringIO(raw_text) as handle:
+			ofx = OfxParser.parse(handle)
+	except Exception as exc:
+		app.logger.warning("Rejected malformed OFX upload: %s", type(exc).__name__)
+		raise UploadProcessingError("The uploaded OFX statement could not be read safely.") from exc
 
 	transactions = []
 
@@ -1206,6 +1331,7 @@ def parse_ofx_transactions(file_path: Path) -> list[dict[str, object]]:
 		parsed.append(
 			{
 				"index": index,
+				"fitid": str(getattr(txn, "id", "") or "").strip() or None,
 				"description": description,
 				"amount": abs(amount),
 				"payment_date": payment_date,
@@ -1222,6 +1348,7 @@ def stage_ofx_file(
 	source_path = Path(file_storage.filename)
 	safe_name = secure_filename(source_path.name) or "statement.ofx"
 	temp_path = UPLOAD_DIR / f"batch{batch_id}_{safe_name}"
+	stored_path: Path | None = None
 	file_storage.save(temp_path)
 
 	try:
@@ -1239,79 +1366,64 @@ def stage_ofx_file(
 		stored_path = UPLOAD_DIR / stored_name
 		temp_path.replace(stored_path)
 
-		cursor = execute(
-			"""
-			INSERT INTO import_files (batch_id, original_filename, stored_filename, file_hash, file_date)
-			VALUES (?, ?, ?, ?, ?)
-			""",
-			(batch_id, original_filename, stored_name, file_hash, file_date),
-		)
-		file_id = cursor.lastrowid
-		staged_rows = 0
-
-		for txn in transactions:
-			description = str(txn["description"]).strip()
-			amount = parse_money(txn["amount"])
-			payment_date = str(txn["payment_date"])
-			if not description or amount is None:
-				continue
-			duplicate_row = query_one(
+		with db_transaction():
+			cursor = execute(
 				"""
-				SELECT 1
-				FROM payments
-				WHERE payment_date = ?
-				  AND supplier_name = ?
-				  AND amount_paid = ?
-				UNION
-				SELECT 1
-				FROM staged_payments
-				WHERE payment_date = ?
-				  AND supplier_name = ?
-				  AND amount_paid = ?
-				LIMIT 1
+				INSERT INTO import_files (batch_id, original_filename, stored_filename, file_hash, file_date)
+				VALUES (?, ?, ?, ?, ?)
 				""",
-				(
-					payment_date,
-					description,
-					amount,
-					payment_date,
-					description,
-					amount,
-				),
+				(batch_id, original_filename, stored_name, file_hash, file_date),
 			)
-			if duplicate_row:
-				continue
-			account = resolve_account_for_supplier(description)
-			account_id = account["id"] if account is not None and "id" in account.keys() else None
-			if account is not None and "account_id" in account.keys():
-				account_id = account["account_id"]
-			execute(
-				"""
-				INSERT INTO staged_payments (
-					batch_id, file_id, payment_date, supplier_name, supplier_key,
-					amount_paid, source_sheet, source_row, source_column, account_id
+			file_id = cursor.lastrowid
+			staged_rows = 0
+			file_occurrences: dict[tuple[str, str, Decimal], int] = {}
+			existing_counts: dict[tuple[str, str, Decimal], int] = {}
+
+			for txn in transactions:
+				description = str(txn["description"]).strip()
+				amount = parse_money(txn["amount"])
+				payment_date = str(txn["payment_date"])
+				if not description or amount is None:
+					continue
+				business_key = payment_business_key(payment_date, description, amount)
+				file_occurrences[business_key] = file_occurrences.get(business_key, 0) + 1
+				if business_key not in existing_counts:
+					existing_counts[business_key] = existing_payment_occurrences(payment_date, description, amount)
+				if file_occurrences[business_key] <= existing_counts[business_key]:
+					continue
+				account = resolve_account_for_supplier(description)
+				account_id = account["id"] if account is not None and "id" in account.keys() else None
+				if account is not None and "account_id" in account.keys():
+					account_id = account["account_id"]
+				execute(
+					"""
+					INSERT INTO staged_payments (
+						batch_id, file_id, payment_date, supplier_name, supplier_key,
+						amount_paid, source_sheet, source_row, source_column, account_id
+					)
+					VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+					ON CONFLICT (file_id, source_sheet, source_row, source_column) DO NOTHING
+					""",
+					(
+						batch_id,
+						file_id,
+						payment_date,
+						description,
+						normalize_text(description),
+						money_for_database(amount),
+						"OFX",
+						int(txn["index"]),
+						1,
+						account_id,
+					),
 				)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-				ON CONFLICT (file_id, source_sheet, source_row, source_column) DO NOTHING
-				""",
-				(
-					batch_id,
-					file_id,
-					payment_date,
-					description,
-					normalize_text(description),
-					amount,
-					"OFX",
-					int(txn["index"]),
-					1,
-					account_id,
-				),
-			)
-			staged_rows += 1
+				staged_rows += 1
 
-		finalize_resolved_rows(batch_id)
+			finalize_resolved_rows(batch_id)
 		return file_id, staged_rows, False
 	except Exception:
+		if stored_path is not None:
+			stored_path.unlink(missing_ok=True)
 		temp_path.unlink(missing_ok=True)
 		raise
 
@@ -1337,13 +1449,6 @@ def finalize_resolved_rows(batch_id: int) -> int:
 		JOIN import_files ON import_files.id = staged_payments.file_id
 		WHERE staged_payments.batch_id = ?
 		  AND staged_payments.account_id IS NOT NULL
-		  AND NOT EXISTS (
-			SELECT 1
-			FROM payments
-			WHERE payments.payment_date = staged_payments.payment_date
-			  AND payments.supplier_name = staged_payments.supplier_name
-			  AND payments.amount_paid = staged_payments.amount_paid
-		  )
 		ON CONFLICT (source_file_hash, source_sheet, source_row, source_column) DO NOTHING
 		""",
 		(batch_id,),
@@ -1365,6 +1470,13 @@ def latest_batch_id(source_type: str | None = None) -> int | None:
 def normalize_month(value: str | None) -> str:
 	if not value:
 		return ""
+
+
+def valid_entry_date(value: str) -> str | None:
+	try:
+		return datetime.strptime(value, "%Y-%m-%d").date().isoformat()
+	except (TypeError, ValueError):
+		return None
 	try:
 		return datetime.strptime(value, "%Y-%m").strftime("%Y-%m")
 	except ValueError:
@@ -1440,7 +1552,7 @@ def available_account_source_options() -> list[tuple[str, str]]:
 	return options
 
 
-def report_linked_amounts_for_month(month_value: str | None) -> dict[str, float]:
+def report_linked_amounts_for_month(month_value: str | None) -> dict[str, Decimal]:
 	if not month_value:
 		return {}
 	rows = query_all(
@@ -1455,21 +1567,24 @@ def report_linked_amounts_for_month(month_value: str | None) -> dict[str, float]
 		""",
 		(month_value,),
 	)
-	return {row["description_key"]: float(row["total_amount"] or 0) for row in rows}
+	return {row["description_key"]: money_from_database(row["total_amount"]) for row in rows}
 
 
 def report_totals_for_month(month_value: str | None) -> dict[str, float]:
 	linked_amounts = report_linked_amounts_for_month(month_value)
 	fixed_amounts = report_fixed_amounts_for_month(month_value)
-	fuel_adjustment = sum(fixed_amounts.get(key, 0) for key in REPORT_FIXED_DESCRIPTION_KEYS)
-	totals: dict[str, float] = {}
+	fuel_adjustment = sum(
+		(fixed_amounts.get(key, Decimal("0.00")) for key in REPORT_FIXED_DESCRIPTION_KEYS),
+		Decimal("0.00"),
+	)
+	totals: dict[str, Decimal] = {}
 	for description_key, _description_label in REPORT_DESCRIPTION_OPTIONS:
 		if description_key in REPORT_FIXED_DESCRIPTION_KEYS:
-			totals[description_key] = fixed_amounts.get(description_key, 0)
+			totals[description_key] = fixed_amounts.get(description_key, Decimal("0.00"))
 		elif description_key == "cost_of_sale_fuel":
-			totals[description_key] = linked_amounts.get(description_key, 0) - fuel_adjustment
+			totals[description_key] = linked_amounts.get(description_key, Decimal("0.00")) - fuel_adjustment
 		else:
-			totals[description_key] = linked_amounts.get(description_key, 0)
+			totals[description_key] = linked_amounts.get(description_key, Decimal("0.00"))
 	return totals
 
 
@@ -1523,7 +1638,7 @@ def report_available_accounts_by_description(
 	return available
 
 
-def report_fixed_amounts_for_month(month_value: str | None) -> dict[str, float]:
+def report_fixed_amounts_for_month(month_value: str | None) -> dict[str, Decimal]:
 	if not month_value:
 		return {}
 	rows = query_all(
@@ -1537,7 +1652,7 @@ def report_fixed_amounts_for_month(month_value: str | None) -> dict[str, float]:
 		""",
 		(month_value,),
 	)
-	return {row["description_key"]: float(row["total_amount"] or 0) for row in rows}
+	return {row["description_key"]: money_from_database(row["total_amount"]) for row in rows}
 
 
 def report_fixed_amount_rows() -> list[sqlite3.Row]:
@@ -1671,33 +1786,44 @@ def _login_key() -> str:
 
 
 def _login_is_blocked(key: str) -> bool:
-	now = time.monotonic()
-	with _login_attempts_lock:
-		attempt = _login_attempts.get(key)
-		if not attempt:
-			return False
-		if float(attempt["block_until"]) > now:
-			return True
-		if now - float(attempt["window_started"]) >= LOGIN_FAILURE_WINDOW_SECONDS:
-			_login_attempts.pop(key, None)
-		return False
+	now = time.time()
+	execute(
+		"DELETE FROM login_attempts WHERE block_until <= ? AND window_started < ?",
+		(now, now - LOGIN_FAILURE_WINDOW_SECONDS),
+	)
+	attempt = query_one("SELECT block_until FROM login_attempts WHERE attempt_key = ?", (key,))
+	return bool(attempt and float(attempt["block_until"]) > now)
 
 
 def _record_login_failure(key: str) -> None:
-	now = time.monotonic()
-	with _login_attempts_lock:
-		attempt = _login_attempts.get(key)
+	now = time.time()
+	with db_transaction():
+		attempt = query_one(
+			"SELECT window_started, failures FROM login_attempts WHERE attempt_key = ?",
+			(key,),
+		)
 		if not attempt or now - float(attempt["window_started"]) >= LOGIN_FAILURE_WINDOW_SECONDS:
-			attempt = {"window_started": now, "failures": 0, "block_until": 0.0}
-		_login_attempts[key] = attempt
-		attempt["failures"] = int(attempt["failures"]) + 1
-		if int(attempt["failures"]) >= LOGIN_FAILURE_LIMIT:
-			attempt["block_until"] = now + LOGIN_BLOCK_SECONDS
+			window_started = now
+			failures = 1
+		else:
+			window_started = float(attempt["window_started"])
+			failures = int(attempt["failures"]) + 1
+		block_until = now + LOGIN_BLOCK_SECONDS if failures >= LOGIN_FAILURE_LIMIT else 0.0
+		execute(
+			"""
+			INSERT INTO login_attempts (attempt_key, window_started, failures, block_until)
+			VALUES (?, ?, ?, ?)
+			ON CONFLICT (attempt_key) DO UPDATE SET
+			window_started = excluded.window_started,
+			failures = excluded.failures,
+			block_until = excluded.block_until
+			""",
+			(key, window_started, failures, block_until),
+		)
 
 
 def _clear_login_failures(key: str) -> None:
-	with _login_attempts_lock:
-		_login_attempts.pop(key, None)
+	execute("DELETE FROM login_attempts WHERE attempt_key = ?", (key,))
 
 
 def validate_uploaded_file(path: Path, *, zip_expected: bool) -> None:
@@ -1776,6 +1902,7 @@ def prepare_app() -> None:
 	if request.endpoint in PUBLIC_ENDPOINTS:
 		return
 	initialize_storage()
+	cleanup_expired_artifacts()
 	if not getattr(app, "_seeded_accounts", False):
 		sync_account_names()
 		app._seeded_accounts = True
@@ -1810,6 +1937,7 @@ def login():
 	error_message = None
 
 	if request.method == "POST":
+		initialize_storage()
 		login_key = _login_key()
 		if _login_is_blocked(login_key):
 			flash("Too many failed login attempts. Please try again later.", "danger")
@@ -1907,10 +2035,17 @@ def reports_settings():
 			entry_id = request.form.get("entry_id", type=int)
 			entry_date = request.form.get("entry_date", "").strip()
 			amount = parse_money(request.form.get("amount"))
-			if entry_id and entry_date and amount is not None:
+			validated_date = valid_entry_date(entry_date)
+			if not entry_id:
+				flash("The fixed report entry could not be identified.", "danger")
+			elif not validated_date:
+				flash("Enter a valid date in YYYY-MM-DD format.", "warning")
+			elif amount is None:
+				flash("Enter a finite amount with up to two decimal places.", "warning")
+			else:
 				execute(
 					"UPDATE report_fixed_amounts SET entry_date = ?, amount = ? WHERE id = ?",
-					(entry_date, amount, entry_id),
+					(validated_date, money_for_database(amount), entry_id),
 				)
 		elif description_key in REPORT_LINKED_DESCRIPTION_KEYS:
 			current_selected_ids = set(report_linked_accounts().get(description_key, []))
@@ -1940,10 +2075,15 @@ def reports_settings():
 		elif description_key in REPORT_FIXED_DESCRIPTION_KEYS:
 			entry_date = request.form.get("entry_date", "").strip()
 			amount = parse_money(request.form.get("amount"))
-			if entry_date and amount is not None:
+			validated_date = valid_entry_date(entry_date)
+			if not validated_date:
+				flash("Enter a valid date in YYYY-MM-DD format.", "warning")
+			elif amount is None:
+				flash("Enter a finite amount with up to two decimal places.", "warning")
+			else:
 				execute(
 					"INSERT INTO report_fixed_amounts (description_key, entry_date, amount) VALUES (?, ?, ?)",
-					(description_key, entry_date, amount),
+					(description_key, validated_date, money_for_database(amount)),
 				)
 		return redirect(url_for("reports_settings") + f"#{description_key}")
 
@@ -2091,8 +2231,9 @@ def upload_cash_payments():
                 original_filename=Path(file_storage.filename).name,
                 file_date=file_date,
             )
-        except ValueError as exc:
-            flash(f"Skipped {file_storage.filename}: {exc}", "warning")
+        except (UploadProcessingError, InvalidFileException, zipfile.BadZipFile, OSError, KeyError, IndexError, TypeError, ValueError) as exc:
+            message = str(exc) if isinstance(exc, ValueError) else "The uploaded workbook could not be processed safely."
+            flash(f"Skipped {file_storage.filename}: {message}", "warning")
             continue
         if duplicate_flag:
             duplicates += 1
@@ -2102,6 +2243,7 @@ def upload_cash_payments():
             staged_rows += staged_count
 
     if imported_files == 0 and staged_rows == 0:
+        execute("DELETE FROM import_batches WHERE id = ?", (batch_id,))
         if duplicates:
             flash(f"All {duplicates} uploaded file(s) were already imported.", "info")
         else:
@@ -2162,8 +2304,9 @@ def upload_eft_payments():
 				file_storage=file_storage,
 				original_filename=Path(file_storage.filename).name,
 			)
-		except ValueError as exc:
-			flash(f"Skipped {file_storage.filename}: {exc}", "warning")
+		except (UploadProcessingError, InvalidFileException, zipfile.BadZipFile, OSError, KeyError, IndexError, TypeError, ValueError) as exc:
+			message = str(exc) if isinstance(exc, ValueError) else "The uploaded OFX statement could not be processed safely."
+			flash(f"Skipped {file_storage.filename}: {message}", "warning")
 			continue
 		if duplicate_flag:
 			duplicates += 1
@@ -2173,6 +2316,7 @@ def upload_eft_payments():
 			staged_rows += staged_count
 
 	if imported_files == 0 and staged_rows == 0:
+		execute("DELETE FROM import_batches WHERE id = ?", (batch_id,))
 		if duplicates:
 			flash(f"All {duplicates} uploaded file(s) were already imported.", "info")
 		else:
@@ -2300,7 +2444,7 @@ def account_transactions(account_id: int):
     if not month_value and month_options:
         month_value = month_options[0]["month_value"]
     transactions = account_transactions_for_month(month_value, account_id, source_type) if month_value else []
-    total_amount = sum(row["amount_paid"] for row in transactions)
+    total_amount = sum((money_from_database(row["amount_paid"]) for row in transactions), Decimal("0.00"))
     return render_template(
         "account_transactions.html",
         account_name=account["name"],
